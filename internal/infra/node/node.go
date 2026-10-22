@@ -2556,6 +2556,7 @@ func (node *Node) GetConfiguredPeers(ctx context.Context) ([]Peer, error) {
 					Address:        address.RaftAddress,
 					ServiceAddress: address.ServiceAddress,
 					InstanceID:     bytes.Clone(address.InstanceID),
+					Capabilities:   append([]uint32(nil), address.Capabilities...),
 				})
 			}
 
@@ -3839,7 +3840,7 @@ func initialJoinVoters(peers []Peer, selfID uint64) []uint64 {
 // through WriteConfChange).
 func registerInitialPeers(m *membership.Membership, cfg NodeConfig, includeSelf bool) error {
 	if includeSelf {
-		if err := m.Register(cfg.NodeID, cfg.AdvertiseAddr, cfg.ServiceAdvertiseAddr, cfg.InstanceID); err != nil {
+		if err := m.RegisterWithEvidence(cfg.NodeID, cfg.AdvertiseAddr, cfg.ServiceAdvertiseAddr, cfg.InstanceID, capabilityIDsAsUint32(capabilities.SupportedIDs())); err != nil {
 			return fmt.Errorf("persisting self in peer store: %w", err)
 		}
 	}
@@ -3847,7 +3848,7 @@ func registerInitialPeers(m *membership.Membership, cfg NodeConfig, includeSelf 
 	// Peer discovery carries the durable identity of every configured member;
 	// never create an address-only membership row.
 	for _, p := range cfg.Peers {
-		if err := m.Register(p.ID, p.Address, p.ServiceAddress, p.InstanceID); err != nil {
+		if err := m.RegisterWithEvidence(p.ID, p.Address, p.ServiceAddress, p.InstanceID, p.Capabilities); err != nil {
 			return fmt.Errorf("persisting initial peer %d: %w", p.ID, err)
 		}
 	}
