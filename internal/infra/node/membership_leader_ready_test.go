@@ -46,7 +46,7 @@ func TestAddLearnerWaitsForLeaderReady(t *testing.T) {
 
 	results := make(chan error, 1)
 	go func() {
-		results <- n.AddLearner(t.Context(), 2, "new:7777", "new:8888", []byte("next-instance-id"))
+		results <- n.AddLearner(t.Context(), 2, "new:7777", "new:8888", []byte("next-instance-id"), nil)
 	}()
 
 	require.Never(t, func() bool {
