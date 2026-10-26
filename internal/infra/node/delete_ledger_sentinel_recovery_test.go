@@ -160,7 +160,7 @@ func newDeleteSentinelApplier(t *testing.T, dir string) (*testApplierSetup, func
 	registry := state.NewStateRegistry(c, attributes.New())
 	fsm, err := state.NewMachine(logger, registry, state.NewCacheSnapshotter(logger, registry, nil),
 		s, dal.NewSentinelFactory(s, true), provider, nil, state.NewSharedState(), newNoopNotifier(t), nil,
-		"", 0, func(*raftpb.Entry, *dal.WriteSession) error { return nil })
+		"", 0, func(*raftpb.Entry, *dal.WriteSession) error { return nil }, state.NoopCapabilityPolicyCommitHandler)
 	require.NoError(t, err)
 	recovery := state.NewRecovery(fsm, s)
 	require.NoError(t, recovery.RecoverState())
