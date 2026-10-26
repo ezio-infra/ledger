@@ -398,7 +398,8 @@ type Node struct {
 	// re-admitted while its durable tombstone is still queued in the async FSM
 	// applier. Entries are admission-only node-local guards; committed apply is
 	// still deterministic and the replicated tombstone remains authoritative.
-	pendingRemovals SyncMap[uint64, *pendingRemoval]
+	// Distinct committed indexes for one ordinal coexist during follower replay.
+	pendingRemovals pendingRemovalSet
 
 	// confChangeMu serializes external ConfChange operations (AddLearner,
 	// RemoveNode, PromoteLearner) so that only one proposal is in-flight at a
@@ -411,8 +412,8 @@ type Node struct {
 	// when another ConfChange is pending. Accessed only from the orchestrate loop.
 	lastAutoPromote map[uint64]time.Time
 
-	// pendingReads tracks in-flight ReadIndex requests, keyed by unique request ID.
-	pendingReads *SyncMap[uint64, *readIndexRequest]
+	// pendingReads tracks in-flight ReadIndex requests, keyed by the full opaque context.
+	pendingReads *SyncMap[string, *readIndexRequest]
 
 	// indexTracker provides an accurate prediction of the next Raft index.
 	// Incremented by Propose() (all proposals) and processReady() (non-proposal
@@ -691,7 +692,7 @@ func NewNode(
 		tasks:            newTaskSet(),
 		stopChannel:      make(chan struct{}),
 		terminalCh:       make(chan struct{}),
-		pendingReads:     &SyncMap[uint64, *readIndexRequest]{},
+		pendingReads:     &SyncMap[string, *readIndexRequest]{},
 		membership:       membership,
 		lastAutoPromote:  make(map[uint64]time.Time),
 		indexTracker:     NewIndexTracker(initialIndex(wal)),
@@ -1499,11 +1500,7 @@ func (node *Node) retryReadySnapshotSync(stop chan struct{}, rd raft.Ready) {
 func (node *Node) resolveReadyReadStates(rd raft.Ready) {
 	// Resolve pending ReadIndex requests from rd.ReadStates.
 	for _, rs := range rd.ReadStates {
-		reqID, ok := parseReadIndexContext(rs.RequestCtx)
-		if !ok {
-			continue
-		}
-
+		reqID := string(rs.RequestCtx)
 		req, loaded := node.pendingReads.Load(reqID)
 		if !loaded {
 			continue
@@ -1569,6 +1566,7 @@ func (node *Node) installReadySnapshot(ctx context.Context, stop chan struct{}, 
 		if err := node.wal.ApplySnapshot(rd.Snapshot); err != nil {
 			return fmt.Errorf("applying snapshot to storage: %w", err)
 		}
+
 		// ApplySnapshot replaces the WAL's cached log. A Ready may also carry
 		// entries after the snapshot: restore that suffix before acknowledging
 		// storage. Keep the initial append in persistReady so HardState never
@@ -1946,7 +1944,7 @@ func shouldTickRaft(status int32) bool {
 }
 
 func (node *Node) orchestrate(ctx context.Context, stop chan struct{}) error {
-	snapshotStatusCh := node.transport.SnapshotStatus()
+	deliveryResultsCh := node.transport.DeliveryResults()
 	tickInterval := node.config.TickInterval
 	if tickInterval == 0 {
 		tickInterval = 100 * time.Millisecond
@@ -2021,6 +2019,19 @@ func (node *Node) orchestrate(ctx context.Context, stop chan struct{}) error {
 		}
 	}
 
+	// Transport owns delivery only; Raft feedback stays on its single owner.
+	reportDelivery := func(result DeliveryResult) {
+		if result.Type != raftpb.MsgSnap {
+			return
+		}
+		status := raft.SnapshotFailure
+		if result.Success {
+			status = raft.SnapshotFinish
+		}
+		node.rawNode.ReportSnapshot(result.PeerID, status)
+		maybeCreateReady()
+	}
+
 	// stepResponses drains a batch from node.localResponseCh: it Steps the
 	// responses back into rawNode (bumping Applied for the batch that
 	// runCommitter just committed) and then checks whether the new state
@@ -2065,9 +2076,8 @@ func (node *Node) orchestrate(ctx context.Context, stop chan struct{}) error {
 			if err := stepResponses(msgs); err != nil {
 				return err
 			}
-		case result := <-snapshotStatusCh:
-			node.rawNode.ReportSnapshot(result.PeerID, result.Status)
-			maybeCreateReady()
+		case result := <-deliveryResultsCh:
+			reportDelivery(result)
 		case <-stop:
 			node.logger.Infof("Stopping readyLoop as context was cancelled")
 			node.applier.Interrupt()
@@ -2086,9 +2096,8 @@ func (node *Node) orchestrate(ctx context.Context, stop chan struct{}) error {
 				if err := stepResponses(msgs); err != nil {
 					return err
 				}
-			case result := <-snapshotStatusCh:
-				node.rawNode.ReportSnapshot(result.PeerID, result.Status)
-				maybeCreateReady()
+			case result := <-deliveryResultsCh:
+				reportDelivery(result)
 			case msgs := <-node.transport.RecvMediumPriority():
 				err := stepMessages(msgs)
 				if err != nil {
@@ -2153,9 +2162,8 @@ func (node *Node) orchestrate(ctx context.Context, stop chan struct{}) error {
 					return nil
 				case nodeID := <-node.transport.Unreachable():
 					node.rawNode.ReportUnreachable(nodeID)
-				case result := <-snapshotStatusCh:
-					node.rawNode.ReportSnapshot(result.PeerID, result.Status)
-					maybeCreateReady()
+				case result := <-deliveryResultsCh:
+					reportDelivery(result)
 				case msgs := <-node.transport.RecvHighPriority():
 					err := stepMessages(msgs)
 					if err != nil {
@@ -2792,28 +2800,32 @@ func (node *Node) SetObserver(obs *Observer) {
 }
 
 // proposeConfChangeAndWait proposes a ConfChange via the orchestrate loop and
-// waits for it to be committed. Returns (index, true, nil) on commit,
-// (0, false, nil) if the proposal was likely dropped (timeout), or
+// waits for its durable commit notification. The caller owns one pending waiter
+// for the entire logical operation. Returns (index, true, nil) on notification,
+// (0, false, nil) when the retry timer expires before notification, or
 // (0, false, err) on error.
 // The proposeFn is dispatched via execClusterCommand (rawNode is not thread-safe).
 func (node *Node) proposeConfChangeAndWait(
 	ctx context.Context,
 	proposalID string,
-	nodeID uint64,
-	expectedTypes []raftpb.ConfChangeType,
+	pending *pendingConfChange,
 	proposeFn func() error,
 	timeout time.Duration,
 ) (uint64, bool, error) {
-	pending := &pendingConfChange{
-		nodeID:        nodeID,
-		expectedTypes: append([]raftpb.ConfChangeType(nil), expectedTypes...),
-		future:        futures.New[uint64](),
-	}
+	err := node.execClusterCommand(ctx, false, func() error {
+		current, ok := node.pendingConfChanges.Load(proposalID)
+		if !ok {
+			// finishReady consumed this operation's waiter at commit. A retry
+			// queued during WAL persistence must await that same future rather
+			// than revalidate or propose the already-committed change.
+			return nil
+		}
+		if current != pending {
+			return fmt.Errorf("invariant: ConfChange proposal %q has a different waiter", proposalID)
+		}
 
-	node.pendingConfChanges.Store(proposalID, pending)
-	defer node.pendingConfChanges.CompareAndDelete(proposalID, pending)
-
-	err := node.execClusterCommand(ctx, false, proposeFn)
+		return proposeFn()
+	})
 	if err != nil {
 		return 0, false, err
 	}
@@ -2823,7 +2835,8 @@ func (node *Node) proposeConfChangeAndWait(
 
 	committedIndex, err := pending.future.Wait(timeoutCtx)
 	if err != nil {
-		// Timeout (deadline exceeded) means the proposal was likely dropped — not an error.
+		// A timeout permits another attempt, which rechecks on the orchestrator
+		// whether this operation already committed before proposing again.
 		if timeoutCtx.Err() != nil && ctx.Err() == nil {
 			return 0, false, nil
 		}
@@ -2869,14 +2882,24 @@ func (node *Node) retryConfChange(
 	node.confChangeMu.Lock()
 	defer node.confChangeMu.Unlock()
 
+	// The timer retries proposals that Raft may have dropped, not the logical
+	// operation. Keep its waiter even after finishReady consumes the map entry
+	// and while WAL persistence still delays resolution of the original future.
+	pending := &pendingConfChange{
+		nodeID:        nodeID,
+		expectedTypes: append([]raftpb.ConfChangeType(nil), expectedTypes...),
+		future:        futures.New[uint64](),
+	}
+	node.pendingConfChanges.Store(proposalID, pending)
+	defer node.pendingConfChanges.CompareAndDelete(proposalID, pending)
+
 	retryInterval := max(node.config.TickInterval*time.Duration(node.config.HeartbeatTick)*3, 500*time.Millisecond)
 
 	for {
 		committedIndex, committed, err := node.proposeConfChangeAndWait(
 			ctx,
 			proposalID,
-			nodeID,
-			expectedTypes,
+			pending,
 			proposeFn,
 			retryInterval,
 		)
@@ -3290,7 +3313,7 @@ func (node *Node) trackCommittedRemoval(nodeID uint64, instanceID []byte, commit
 		committedIndex: committedIndex,
 	}
 
-	actual, loaded := node.pendingRemovals.LoadOrStore(nodeID, pending)
+	actual, loaded := node.pendingRemovals.loadOrStore(nodeID, pending)
 	if loaded {
 		if actual.committedIndex != committedIndex || !bytes.Equal(actual.instanceID, instanceID) {
 			return nil, fmt.Errorf(
@@ -3329,15 +3352,15 @@ func (node *Node) verifyAndClearPendingRemoval(nodeID uint64, pending *pendingRe
 		return false, err
 	}
 
-	return node.pendingRemovals.CompareAndDelete(nodeID, pending), nil
+	return node.pendingRemovals.compareAndDelete(nodeID, pending), nil
 }
 
 // schedulePendingRemovalCleanup keeps the admission barrier independent from
 // the RPC lifecycle. Once the committed removal is durable, the replicated
 // tombstone becomes authoritative and the node-local guard must be cleared so
-// a later forget-removed can re-admit the same identity. CompareAndDelete
-// prevents an older cleanup from deleting a newer removal barrier for a reused
-// node ID.
+// a later deliberate tombstone removal can re-admit the same identity. Deleting
+// only the exact event pointer prevents older cleanup from releasing another
+// removal's protection at a reused node ID or committed index.
 func (node *Node) schedulePendingRemovalCleanup(nodeID uint64, pending *pendingRemoval) {
 	cleanupCtx, cancel := context.WithCancel(context.Background())
 
@@ -3390,9 +3413,7 @@ func (node *Node) schedulePendingRemovalCleanup(nodeID uint64, pending *pendingR
 // failing closed is required because an apply delay must never let the removed
 // live pod rejoin. The replicated tombstone is authoritative after that point.
 func (node *Node) isRemovalPending(nodeID uint64, instanceID []byte) bool {
-	pending, ok := node.pendingRemovals.Load(nodeID)
-
-	return ok && bytes.Equal(pending.instanceID, instanceID)
+	return node.pendingRemovals.contains(nodeID, instanceID)
 }
 
 // ForceRemoveNode removes a node from the Raft cluster by directly applying a

@@ -128,6 +128,23 @@ resource-close count as evidence of a whole-constructor shutdown bound. See the
 
 ## Concurrent transition scenarios
 
+PostgreSQL mirror gap reads add a source-session lifetime beneath the worker.
+A gap read owns one pooled `READ COMMITTED` transaction and a bucket-wide
+`SHARE` lock until commit or rollback. `NOWAIT` conflicts return immediately;
+the failed transaction must still be rolled back. When the fetch context is
+cancelled after lock acquisition, rollback uses a detached context with a
+five-second timeout. A failed pgx rollback closes the connection. No live
+transaction may return to the pool, and no source lock may survive into
+translation, preload or Raft application.
+
+The adapter's integration regression cancels from a real pgx query tracer
+immediately after successful lock acquisition. Its oracle includes no returned
+rows, retry through a single-connection pool, and an independent source INSERT
+afterward to detect leaked locks. Keep the manager's existing independent
+initialization/leadership-loss cancellation tests: cancelling a gap fetch does
+not prove cancellation of source construction, or vice versa. Applied source
+ordering and permanent-gap semantics belong to `mirror-ingestion-contracts`.
+
 At minimum, attempt to falsify these sequences with deterministic barriers:
 
 1. Start blocks after acquiring a listener, store, registration or source; Stop
@@ -206,17 +223,19 @@ bash scripts/ai-audit-challenge <audit-result.json>
 The same clean HEAD must be used for both passes. Manifest work must not launch
 the product audit. Jira publication and fixes remain separately authorized.
 
-## Snapshot delivery result publishers
+## Message delivery result publishers
 
-A sent snapshot result belongs to the peer connection's lifetime and is consumed
+A per-message delivery result belongs to the peer connection's lifetime and is consumed
 by the node's orchestrate owner. The bounded result queue must backpressure
 instead of silently losing the only event that releases `StateSnapshot`. Peer
 removal cancels its publishers before joining the connection; transport stop
 releases dispatcher publishers as well. Dispatcher-queue rejection is published
 by the Ready worker and must additionally observe its task stop channel. Fill
-the status queue without a consumer, then stop and join Node.Run before
+the result queue without a consumer, then stop and join Node.Run before
 transport shutdown while keeping the run context live; cancellation of a
 context supplied only by the test does not prove this production caller. Delayed acknowledgement and abandoned
-pending-response cleanup must produce at most one snapshot outcome per attempt.
+pending-response cleanup must produce at most one outcome per message attempt.
+The same cancellation and duplicate-suppression contract covers ordinary
+messages; only Node translates snapshot outcomes into Raft snapshot status.
 Exercise both connection rejection/recovery and cancellation while no result
 consumer is available; transport acceptance alone does not prove FSM readiness.
