@@ -26,6 +26,11 @@ type Proposal struct {
 	commandID            uint64
 	data                 []byte
 	requiredCapabilities []capabilities.CapabilityID
+	// activePolicyCapabilities is populated by the proposal factory for
+	// SetClusterPolicy orders.  Keeping the typed candidate alongside the
+	// serialized command lets the leader validate activation evidence before
+	// handing the bytes to Raft without decoding the command a second time.
+	activePolicyCapabilities []capabilities.CapabilityID
 }
 
 func newProposal(commandID uint64, data []byte, required []capabilities.CapabilityID) *Proposal {
@@ -58,7 +63,19 @@ func NewProposal(commandID uint64, command *raftcmdpb.Proposal) (*Proposal, erro
 		return nil, err
 	}
 
-	return newProposal(commandID, data, prepared.RequiredCapabilities()), nil
+	proposal := newProposal(commandID, data, prepared.RequiredCapabilities())
+	for _, order := range command.GetOrders() {
+		policy := order.GetSystemScoped().GetSetClusterPolicy().GetPolicy()
+		if policy == nil {
+			continue
+		}
+		for _, activation := range policy.GetCapabilityActivations() {
+			if activation != nil && activation.GetActive() {
+				proposal.activePolicyCapabilities = append(proposal.activePolicyCapabilities, capabilities.CapabilityID(activation.GetId()))
+			}
+		}
+	}
+	return proposal, nil
 }
 
 // Data returns the serialized proposal data.
@@ -83,4 +100,11 @@ func (p *Proposal) SetPredictedIndex(index uint64) {
 // value instead of decoding the serialized proposal a second time.
 func (p *Proposal) RequiredCapabilities() []capabilities.CapabilityID {
 	return append([]capabilities.CapabilityID(nil), p.requiredCapabilities...)
+}
+
+// ActivePolicyCapabilities returns the active capabilities requested by a
+// SetClusterPolicy order, if any. The values are derived by NewProposal from
+// the typed command and are not read from the serialized payload.
+func (p *Proposal) ActivePolicyCapabilities() []capabilities.CapabilityID {
+	return append([]capabilities.CapabilityID(nil), p.activePolicyCapabilities...)
 }
