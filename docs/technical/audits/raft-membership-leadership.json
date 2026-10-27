@@ -50,7 +50,11 @@
     "tests/e2e/cluster/get_ledger_snapshot_test.go",
     "tests/e2e/cluster/out_of_sync_election_test.go",
     "tests/antithesis/**",
-    "tests/oracle/**"
+    "tests/oracle/**",
+    "internal/pkg/proposals/**",
+    "internal/pkg/commands/**",
+    "internal/infra/plan/runner.go",
+    "tests/e2e/cluster/proposal_payload_test.go"
   ],
   "related_docs": [
     "AGENTS.md",
@@ -65,7 +69,8 @@
     "docs/ops/cluster-operations.md",
     "docs/technical/contributing/testing.md",
     "docs/technical/contributing/ai-audit.md",
-    "docs/technical/contributing/ai-audit-challenge.md"
+    "docs/technical/contributing/ai-audit-challenge.md",
+    "docs/technical/architecture/subsystems/consensus/proposal-payloads.md"
   ],
   "invariants": [
     "Valid historical remove/add/remove cycles at one ordinal replay in one Ready or across delayed cleanup without conflicts. Each committed removal retains independent identity admission protection until its durable applied index and matching tuple tombstone are verified; exact duplicates reuse the event, same-index contradictory identities fail, and stale cleanup cannot release another event. Caller cancellation cannot own protection.",
@@ -82,7 +87,8 @@
     "ReadIndex certification requires the active leader and a quorum of the current voter configuration, and the certified index must be applied before the read proceeds. Only an explicitly stale read may bypass that certificate; projection semantics after the barrier belong to read-consistency-projections.",
     "Snapshot send/install must bind compatible Raft metadata, ConfState, FSM snapshot, spool/catch-up state, and peer identity. The receiver must drain conflicting apply work and remain non-serving until installation and subsequent synchronization establish a coherent applied and durable horizon.",
     "Committed entry ordering and membership outcomes must survive leader crash, transfer, restart, retained-log catch-up, and snapshot catch-up without loss, double durable effect, or configuration regression. Pure deterministic FSM/cache correctness after the consensus boundary belongs to fsm-determinism-cache-coverage.",
-    "A combined snapshot/entry Ready must preserve its entry suffix in live Storage and after WAL reopen before any peer or local storage acknowledgement, retaining the original entries/HardState durability order."
+    "A combined snapshot/entry Ready must preserve its entry suffix in live Storage and after WAL reopen before any peer or local storage acknowledgement, retaining the original entries/HardState durability order.",
+    "During proposal payload expansion, every production Raft writer must lower logical ExecutionBatch and SetClusterPolicyProposal envelopes to the released wire fields. Both replay forms must preserve canonical audit bytes, coverage targets, checkpoint boundaries, technical-only HLC behavior, and post-checkpoint policy restore; malformed envelopes must fail before any entry in the decoded batch mutates state. Decoder support alone must not enable payload-only writes."
   ],
   "adversarial_questions": [
     "Does an interrupted cluster command return retryable Unavailable when its Raft run has stopped, including wrapped raft.ErrStopped, while unrelated failures retain their sanitized error classification?",
