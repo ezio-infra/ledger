@@ -3344,8 +3344,8 @@ func (x *ExecutionBatch) GetTechnicalUpdates() []*TechnicalUpdate {
 	return nil
 }
 
-// SetClusterPolicyProposal is an internal, audited control proposal. Its audit
-// evidence stores the native control; historical SetClusterPolicyOrder remains readable.
+// SetClusterPolicyProposal updates operational state without business audit or logs.
+// Historical SetClusterPolicyOrder remains readable.
 type SetClusterPolicyProposal struct {
 	state         protoimpl.MessageState  `protogen:"open.v1"`
 	Policy        *commonpb.ClusterPolicy `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
@@ -3390,7 +3390,7 @@ func (x *SetClusterPolicyProposal) GetPolicy() *commonpb.ClusterPolicy {
 	return nil
 }
 
-// Proposal separates execution batches from audited cluster-policy controls.
+// Proposal separates execution batches from operational cluster-policy controls.
 // Producers write payloads directly after a full-stop upgrade. Legacy fields
 // remain readable for historical WAL replay; old binaries cannot read new writes.
 type Proposal struct {
