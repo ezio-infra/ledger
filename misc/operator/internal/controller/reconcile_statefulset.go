@@ -82,34 +82,14 @@ func (r *ClusterReconciler) reconcileStatefulSetWithExec(ctx context.Context, le
 			// so that the image, env vars, etc. are applied. This allows
 			// pods to start (e.g. after an image change) before we attempt
 			// the Raft scale-down which requires running containers.
-			sts := &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
-					Namespace: ledger.Namespace,
-				},
-			}
 			savedReplicas := effective.Spec.Replicas
 			effective.Spec.Replicas = &previousReplicas
-			_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
-				sts.Labels = commonLabels(ledger)
-				desired := buildStatefulSetSpec(effective, specHash, credentials, targetTLSMode)
-
-				if sts.CreationTimestamp.IsZero() {
-					sts.Spec = desired
-				} else {
-					if volumeClaimTemplatesChanged(sts.Spec.VolumeClaimTemplates, desired.VolumeClaimTemplates) {
-						desired.Template = preserveExistingStorageWiring(sts.Spec.Template, desired.Template)
-					}
-					sts.Spec.Replicas = desired.Replicas
-					sts.Spec.Template = withKubectlRestartedAt(sts.Spec.Template, desired.Template)
-					sts.Spec.UpdateStrategy = desired.UpdateStrategy
-					sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.PersistentVolumeClaimRetentionPolicy
-					sts.Spec.MinReadySeconds = desired.MinReadySeconds
-				}
-
-				return controllerutil.SetControllerReference(ledger, sts, r.Scheme)
-			})
+			desired := buildStatefulSetSpec(effective, specHash, credentials, targetTLSMode)
 			effective.Spec.Replicas = savedReplicas
+			if volumeClaimTemplatesChanged(existing.Spec.VolumeClaimTemplates, desired.VolumeClaimTemplates) {
+				desired.Template = preserveExistingStorageWiring(existing.Spec.Template, desired.Template)
+			}
+			err := r.upsertStatefulSet(ctx, ledger, desired)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("updating StatefulSet spec before scale-down: %w", err)
 			}
@@ -126,13 +106,6 @@ func (r *ClusterReconciler) reconcileStatefulSetWithExec(ctx context.Context, le
 				return ctrl.Result{}, fmt.Errorf("removing Raft nodes before scale-down: %w", err)
 			}
 		}
-	}
-
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ledger.Namespace,
-		},
 	}
 
 	desired := buildStatefulSetSpec(effective, specHash, credentials, targetTLSMode)
@@ -160,26 +133,7 @@ func (r *ClusterReconciler) reconcileStatefulSetWithExec(ctx context.Context, le
 		}
 	}
 
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
-		sts.Labels = commonLabels(ledger)
-
-		if sts.CreationTimestamp.IsZero() {
-			// New StatefulSet — set the full spec.
-			sts.Spec = desired
-		} else {
-			// Existing StatefulSet — only update mutable fields.
-			// ServiceName, Selector, PodManagementPolicy and
-			// VolumeClaimTemplates are immutable after creation.
-			sts.Spec.Replicas = desired.Replicas
-			sts.Spec.Template = withKubectlRestartedAt(sts.Spec.Template, desired.Template)
-			sts.Spec.UpdateStrategy = desired.UpdateStrategy
-			sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.PersistentVolumeClaimRetentionPolicy
-			sts.Spec.MinReadySeconds = desired.MinReadySeconds
-		}
-
-		return controllerutil.SetControllerReference(ledger, sts, r.Scheme)
-	})
-	if err != nil {
+	if err := r.upsertStatefulSet(ctx, ledger, desired); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -210,6 +164,54 @@ func (r *ClusterReconciler) reconcileStatefulSetWithExec(ctx context.Context, le
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// upsertStatefulSet is the single path that creates or updates the workload.
+// The stopped-upgrade gate calls the ordinary reconciler only after every old
+// Pod has disappeared; it never constructs a second StatefulSet spec.
+func (r *ClusterReconciler) upsertStatefulSet(ctx context.Context, ledger *ledgerv1alpha1.Cluster, desired appsv1.StatefulSetSpec) error {
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: resourceName(ledger.Name), Namespace: ledger.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		sts.Labels = commonLabels(ledger)
+		if sts.CreationTimestamp.IsZero() {
+			sts.Spec = desired
+		} else {
+			// ServiceName, Selector, PodManagementPolicy and claim templates
+			// are immutable after creation.
+			applyMutableStatefulSetSpec(sts, desired)
+		}
+
+		return controllerutil.SetControllerReference(ledger, sts, r.Scheme)
+	})
+
+	return err
+}
+
+func applyMutableStatefulSetSpec(sts *appsv1.StatefulSet, desired appsv1.StatefulSetSpec) {
+	sts.Spec.Replicas = desired.Replicas
+	sts.Spec.Template = withKubectlRestartedAt(sts.Spec.Template, desired.Template)
+	sts.Spec.UpdateStrategy = desired.UpdateStrategy
+	sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.PersistentVolumeClaimRetentionPolicy
+	sts.Spec.MinReadySeconds = desired.MinReadySeconds
+}
+
+// reconcileStatefulSetRetentionPolicy applies the same policy used by ordinary
+// StatefulSet creation. During a stopped upgrade buildRetentionPolicy always
+// returns Retain; callers must requeue until the StatefulSet controller has
+// observed the updated generation before detaching or reusing claims.
+func (r *ClusterReconciler) reconcileStatefulSetRetentionPolicy(ctx context.Context, ledger *ledgerv1alpha1.Cluster, sts *appsv1.StatefulSet) (bool, error) {
+	desired := buildRetentionPolicy(ledger)
+	if sts.Spec.PersistentVolumeClaimRetentionPolicy != nil &&
+		*sts.Spec.PersistentVolumeClaimRetentionPolicy == *desired {
+		return false, nil
+	}
+	updated := sts.DeepCopy()
+	updated.Spec.PersistentVolumeClaimRetentionPolicy = desired
+	if err := r.Update(ctx, updated); err != nil {
+		return false, fmt.Errorf("updating StatefulSet claim retention policy: %w", err)
+	}
+
+	return true, nil
 }
 
 // preserveExistingStorageWiring keeps the Pod template compatible with the
