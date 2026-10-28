@@ -3345,7 +3345,7 @@ func (x *ExecutionBatch) GetTechnicalUpdates() []*TechnicalUpdate {
 }
 
 // SetClusterPolicyProposal is an internal, audited control proposal. Its audit
-// evidence retains the historical SetClusterPolicyOrder representation.
+// evidence stores the native control; historical SetClusterPolicyOrder remains readable.
 type SetClusterPolicyProposal struct {
 	state         protoimpl.MessageState  `protogen:"open.v1"`
 	Policy        *commonpb.ClusterPolicy `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
