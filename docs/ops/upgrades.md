@@ -26,8 +26,9 @@ remain, restore the source StatefulSet before changing the image tag.
 When an RC image change also changes volume templates, the operator completes
 the RC rollout before recreating the StatefulSet for the volume change.
 Old and new voters must communicate and apply each committed entry identically
-while they coexist. A change that cannot meet this requirement needs a staged
-rollout design or must wait for a different compatibility line.
+while they coexist. A release that cannot meet this requirement must require
+a full stop.
+The RC.1 to RC.2 proposal payload cutover below uses that procedure.
 
 Before tagging a new release, verify the upgrade with state created by the
 supported source releases. Cover affected Pebble records, Raft log and snapshot
@@ -36,20 +37,24 @@ projections. Document the upgrade procedure and rollback boundary in the
 release notes. Delay the release if the target cannot read or migrate the source
 state.
 
-The upgrade classes below describe existing procedures. RC changes must use the
-rolling class; coordinated restart and rebuild or restore are retained for
-earlier development revisions and explicitly separate compatibility lines.
+Choose the upgrade class required by the target release. RC.2 requires a
+coordinated restart because RC.1 cannot execute its new proposal payloads.
+The operator implementation for this transition is tracked in
+[PR #2410](https://github.com/formancehq/ledger/pull/2410); release the server
+cutover together with that operator support.
 
 | Class | When it applies | Procedure |
 |-------|-----------------|-----------|
-| Rolling | Required between adjacent RCs on the same release line. | Restart followers one at a time, wait for each to catch up, transfer leadership to an upgraded voter, then restart the old leader. |
-| Coordinated restart | A separate compatibility line that cannot safely mix binaries. | Enable maintenance mode, wait for every voter to apply the maintenance barrier durably, stop every node, replace all binaries, then restart without a mixed-version window. Preserve or migrate the released data. |
+| Rolling | Adjacent releases whose binaries can safely coexist. | Restart followers one at a time, wait for each to catch up, transfer leadership to an upgraded voter, then restart the old leader. |
+| Coordinated restart | A release requiring downtime, including RC.1 to RC.2. | Enable maintenance mode, wait for every voter to apply the maintenance barrier durably, stop every node, replace all binaries, then restart without a mixed-version window. Preserve or migrate the released data. |
 | Migrate or restore | A separate line with a changed persisted or backup format, or development state before the first RC. | Follow a tested migration or restore a backup supported by the target release. A wipe or external rebuild is permitted only for unsupported pre-RC development state. Verify the complete state before serving writes. |
 
-Before publishing an RC update, demonstrate the rolling class from the
-immediately preceding RC binary to the target binary in one cluster, including
-leadership transfer, writes, replay, and restart. Record the source and target
-builds and the results in the release validation. If the path fails, fix the
+Before publishing an RC update, demonstrate its required upgrade class from
+the immediately preceding RC binary to the target binary in one cluster.
+For a full stop, prove every source process exits before any target starts,
+volumes survive, and reads, writes, replay and restart succeed afterward.
+For rolling upgrades, also exercise leadership transfer during coexistence.
+Record the source and target builds and the results in the release validation. If the path fails, fix the
 change before release. Do not infer support from a successful single-node restart.
 
 For upgrades from builds before `v3.0.0-rc.1`, the change-specific constraints
@@ -171,16 +176,21 @@ When persisted storage is compatible but mixed binaries are not:
 upgrade Ledger servers or decide whether a server revision is storage- or
 wire-compatible.
 
-## Proposal payload expansion
+## Proposal payload cutover
 
-The proposal oneof is introduced in an expansion phase. Producers use
-`ExecutionBatch` or `SetClusterPolicyProposal` internally, but the shared runner
-serializes the historical proposal fields before replication. Old and new
-replicas therefore receive the same command representation. Existing WAL,
-snapshots, backups, and audit history need no rewrite or operator migration.
-No capability activation or additional deployment flag is introduced.
+The RC.1 to RC.2 transition requires the coordinated restart procedure above.
+Stop every old node before starting any target node, and keep the WAL and data
+volumes. The target reads historical entries and writes `ExecutionBatch` or
+`SetClusterPolicyProposal` directly. Existing snapshots, backups and audit
+history need no rewrite or backfill. No capability flag enables this format.
 
-This phase adds no new rollback restriction. Emitting payload-only Raft entries
-is a separate, future cutover requiring cluster-wide decoder readiness and its
-own rollback boundary. Do not infer permission to emit them merely because the
-new binary can decode them. See the [proposal migration contract](../technical/architecture/subsystems/consensus/proposal-payloads.md).
+Install the required-downtime operator from
+[PR #2410](https://github.com/formancehq/ledger/pull/2410) before requesting this
+image upgrade. An older operator that performs a rolling upgrade is unsafe for
+this transition. For unmanaged deployments, enforce the full stop yourself.
+
+Do not return to RC.1 after starting the target on the production volumes.
+The first new payload written to WAL, including startup technical updates,
+closes the rollback window even while maintenance is active. A downgrade
+requires a separately validated recovery from a pre-upgrade backup, accounting
+for later writes. See the [proposal migration contract](../technical/architecture/subsystems/consensus/proposal-payloads.md).

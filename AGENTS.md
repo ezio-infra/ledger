@@ -15,7 +15,9 @@ Each RC update is upgraded sequentially from the immediately preceding RC in
 the same release line. The operator rejects skipped RCs by comparing the
 current StatefulSet image tag with the requested Cluster image tag. Old and new
 voters must communicate and apply the same committed entries identically while
-they coexist.
+they coexist. The RC.1 to RC.2 proposal payload cutover requires a full stop:
+all source nodes must exit before any target starts. See the upgrade policy
+for the operator dependency and rollback boundary.
 
 - Classify persisted, Raft, snapshot, backup, and audit changes against the RC
   baseline. Include a tested migration or prove existing data remains valid.
@@ -25,7 +27,8 @@ they coexist.
   numbers, wire types, field identity, and enum numbers during the RC.
 - Preserve field and enum numbers stored in released Raft, snapshots, backups,
   and audit records. Internal-only format changes require a safe migration and
-  a mixed-version rollout design. Reserve removed numbers and names when they
+  a rollout design that either preserves mixed-version operation or requires a
+  full stop. Reserve removed numbers and names when they
   must not be reused; a reservation does not migrate data.
 - Read `docs/technical/contributing/protobuf.md` before changing `.proto` files.
 

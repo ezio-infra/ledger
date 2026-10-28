@@ -3391,8 +3391,8 @@ func (x *SetClusterPolicyProposal) GetPolicy() *commonpb.ClusterPolicy {
 }
 
 // Proposal separates execution batches from audited cluster-policy controls.
-// During the expansion stage, producers lower payloads to the legacy wire form
-// before replication so released nodes can execute every committed command.
+// Producers write payloads directly after a full-stop upgrade. Legacy fields
+// remain readable for historical WAL replay; old binaries cannot read new writes.
 type Proposal struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Id    uint64                 `protobuf:"fixed64,1,opt,name=id,proto3" json:"id,omitempty"` // Random proposal ID
