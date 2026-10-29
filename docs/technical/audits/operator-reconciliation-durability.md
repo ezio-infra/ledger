@@ -49,6 +49,24 @@ Ledger process restart and cluster-level availability from recovery of the
 intended PVC/node. Record inspected areas and untested boundaries in residual
 risk rather than claiming exhaustive coverage.
 
+## Derived object ownership boundary
+
+Cluster-derived object names are not unique by construction (see
+[derived object ownership](../architecture/subsystems/operator/derived-object-ownership.md)).
+A name match is never proof of ownership. A finding here must show a reachable
+path that adopts, mutates, deletes, reports or execs into an object under a
+derived name without first establishing that the Cluster's UID controls it
+(for a pod: that the Cluster's StatefulSet UID controls it), or that deletes it
+by name without pinning the delete to the inspected UID. A refused orphan or a
+same-name object awaiting garbage collection is the documented
+`ResourceNamesAvailable=False` behaviour, not a defect by itself.
+
+The UID delete precondition guarantees identity only: an ownerReference change
+on the same object between the read and the delete is an accepted race, and so
+is a pod replaced between its ownership read and the exec stream, or a Service
+replaced between its check and a backup Job dialing it. A finding about one of
+these must show more than that window.
+
 ## Ledger target admission boundary
 
 Ledger `spec.name` and `spec.clusterRef` are immutable from CR creation through
