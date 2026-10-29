@@ -103,8 +103,8 @@ func decodeDualFormat(raw []byte, target commonpb.QueryTarget) (*commonpb.QueryF
 	switch trimmed[0] {
 	case '{':
 		// Structured v2 QueryFilter JSON DSL.
-		filter := &commonpb.QueryFilter{}
-		if err := json.Unmarshal(trimmed, filter); err != nil {
+		filter, err := commonpb.UnmarshalQueryFilterForTarget(trimmed, target)
+		if err != nil {
 			return nil, fmt.Errorf("filter: %w", err)
 		}
 

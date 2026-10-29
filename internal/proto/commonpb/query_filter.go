@@ -29,8 +29,9 @@ import (
 //   - address:  `address` (trailing ":" = prefix, else exact); `source` /
 //     `destination` for role-scoped address matches
 //   - `reference`, `reverted` (bool), `ledger`
-//   - built-in transaction uint fields: `id`, `timestamp`, `insertedAt`,
-//     `revertedAt`; log fields: `logId`, `date`
+//   - `id` selects the transaction or log ID by query target; transaction uint
+//     fields: `timestamp`, `insertedAt`, `revertedAt`; log field: `date`.
+//     `logId` remains a legacy log-range alias.
 //   - `asset` (has-asset, via $exists)
 //
 // A value is either a JSON literal or a parameter reference `{"$param": "name"}`
@@ -295,7 +296,7 @@ func marshalLeaf(x *QueryFilter) (map[string]any, error) {
 
 		return kv(opExists, "asset", v), nil
 	case *QueryFilter_LogId:
-		return marshalUintRange("logId", f.LogId.GetCond())
+		return marshalUintRange("id", f.LogId.GetCond())
 	case *QueryFilter_BuiltinUint:
 		field, ok := txBuiltinFieldToJSON[f.BuiltinUint.GetField()]
 		if !ok {
@@ -587,24 +588,34 @@ func marshalAddressMatch(am *AddressMatch) (map[string]any, error) {
 
 // UnmarshalJSON implements json.Unmarshaler for QueryFilter.
 func (x *QueryFilter) UnmarshalJSON(data []byte) error {
+	filter, err := UnmarshalQueryFilterForTarget(data, QueryTarget_QUERY_TARGET_TRANSACTIONS)
+	if err != nil {
+		return err
+	}
+	x.Filter = filter.GetFilter()
+
+	return nil
+}
+
+// UnmarshalQueryFilterForTarget resolves the public id field against the query
+// target. The context-free JSON decoder retains transaction semantics.
+func UnmarshalQueryFilterForTarget(data []byte, target QueryTarget) (*QueryFilter, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil {
-		return err
+		return nil, err
 	}
 
 	op, raw, err := singleOperator(m)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	filter, err := decodeExpression(op, raw)
+	filter, err := decodeExpression(op, raw, target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	x.Filter = filter.GetFilter()
-
-	return nil
+	return filter, nil
 }
 
 // singleOperator returns the single top-level operator key and its raw value.
@@ -622,25 +633,25 @@ func singleOperator(m map[string]json.RawMessage) (string, json.RawMessage, erro
 }
 
 // decodeExpression decodes one DSL node into a QueryFilter.
-func decodeExpression(op string, raw json.RawMessage) (*QueryFilter, error) {
+func decodeExpression(op string, raw json.RawMessage, target QueryTarget) (*QueryFilter, error) {
 	switch op {
 	case opAnd, opOr:
-		return decodeCombinator(op, raw)
+		return decodeCombinator(op, raw, target)
 	case opNot:
-		inner := &QueryFilter{}
-		if err := json.Unmarshal(raw, inner); err != nil {
+		inner, err := UnmarshalQueryFilterForTarget(raw, target)
+		if err != nil {
 			return nil, fmt.Errorf("$not: %w", err)
 		}
 
 		return &QueryFilter{Filter: &QueryFilter_Not{Not: &NotFilter{Filter: inner}}}, nil
 	case opMatch, opGt, opGte, opLt, opLte, opExists, opIn:
-		return decodeLeaf(op, raw)
+		return decodeLeaf(op, raw, target)
 	default:
 		return nil, fmt.Errorf("query filter: unknown operator %q", op)
 	}
 }
 
-func decodeCombinator(op string, raw json.RawMessage) (*QueryFilter, error) {
+func decodeCombinator(op string, raw json.RawMessage, target QueryTarget) (*QueryFilter, error) {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, fmt.Errorf("%s: expected an array: %w", op, err)
@@ -654,7 +665,7 @@ func decodeCombinator(op string, raw json.RawMessage) (*QueryFilter, error) {
 	// a closed range `{"$and":[{"$gte":{"timestamp":1}},{"$lte":{"timestamp":9}}]}`
 	// round-tripping to one BuiltinUintCondition.
 	if op == opAnd {
-		if folded, ok, err := foldRangeAnd(items); err != nil {
+		if folded, ok, err := foldRangeAnd(items, target); err != nil {
 			return nil, err
 		} else if ok {
 			return folded, nil
@@ -663,8 +674,8 @@ func decodeCombinator(op string, raw json.RawMessage) (*QueryFilter, error) {
 
 	filters := make([]*QueryFilter, 0, len(items))
 	for i, it := range items {
-		sub := &QueryFilter{}
-		if err := json.Unmarshal(it, sub); err != nil {
+		sub, err := UnmarshalQueryFilterForTarget(it, target)
+		if err != nil {
 			return nil, fmt.Errorf("%s[%d]: %w", op, i, err)
 		}
 		filters = append(filters, sub)
@@ -680,7 +691,7 @@ func decodeCombinator(op string, raw json.RawMessage) (*QueryFilter, error) {
 // foldRangeAnd detects an $and array of exactly two range-bound leaves on the
 // same field with complementary directions (one lower, one upper) and folds them
 // into a single range condition. ok=false leaves the $and intact.
-func foldRangeAnd(items []json.RawMessage) (*QueryFilter, bool, error) {
+func foldRangeAnd(items []json.RawMessage, target QueryTarget) (*QueryFilter, bool, error) {
 	if len(items) != 2 {
 		return nil, false, nil
 	}
@@ -714,7 +725,7 @@ func foldRangeAnd(items []json.RawMessage) (*QueryFilter, bool, error) {
 	}
 
 	sortBounds(bounds)
-	qf, err := buildRange(bounds[0].field, bounds)
+	qf, err := buildRange(bounds[0].field, bounds, target)
 	if err != nil {
 		return nil, false, err
 	}
@@ -748,7 +759,7 @@ func leafKV(op string, raw json.RawMessage) (string, jsonValue, error) {
 	return field, v, nil
 }
 
-func decodeLeaf(op string, raw json.RawMessage) (*QueryFilter, error) {
+func decodeLeaf(op string, raw json.RawMessage, target QueryTarget) (*QueryFilter, error) {
 	field, value, err := leafKV(op, raw)
 	if err != nil {
 		return nil, err
@@ -758,9 +769,9 @@ func decodeLeaf(op string, raw json.RawMessage) (*QueryFilter, error) {
 	case opExists:
 		return decodeExists(field, value)
 	case opMatch:
-		return decodeMatch(field, value)
+		return decodeMatch(field, value, target)
 	case opGt, opGte, opLt, opLte:
-		return decodeSingleBound(op, field, value)
+		return decodeSingleBound(op, field, value, target)
 	case opIn:
 		return nil, errors.New("$in: not supported for this filter surface")
 	default:
@@ -807,8 +818,10 @@ func decodeExists(field string, value jsonValue) (*QueryFilter, error) {
 	}
 }
 
-func decodeMatch(field string, value jsonValue) (*QueryFilter, error) {
+func decodeMatch(field string, value jsonValue, target QueryTarget) (*QueryFilter, error) {
 	switch field {
+	case "id":
+		return exactIDFilter(value, target)
 	case "address", "source", "destination":
 		return decodeAddressMatch(field, value)
 	case "reference":
@@ -842,6 +855,31 @@ func decodeMatch(field string, value jsonValue) (*QueryFilter, error) {
 
 		return nil, fmt.Errorf("$match: unsupported field %q", field)
 	}
+}
+
+func exactIDFilter(value jsonValue, target QueryTarget) (*QueryFilter, error) {
+	cond := &UintCondition{}
+	if value.isParam() {
+		cond.ParamMin, cond.ParamMax = value.param, value.param
+	} else {
+		id, err := value.asUint64()
+		if err != nil {
+			return nil, fmt.Errorf("id: %w", err)
+		}
+		cond.Min, cond.Max = &id, &id
+	}
+
+	return idFilter(cond, target), nil
+}
+
+func idFilter(cond *UintCondition, target QueryTarget) *QueryFilter {
+	if target == QueryTarget_QUERY_TARGET_LOGS {
+		return &QueryFilter{Filter: &QueryFilter_LogId{LogId: &LogIdCondition{Cond: cond}}}
+	}
+
+	return &QueryFilter{Filter: &QueryFilter_BuiltinUint{BuiltinUint: &BuiltinUintCondition{
+		Field: TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID, Cond: cond,
+	}}}
 }
 
 func decodeAddressMatch(field string, value jsonValue) (*QueryFilter, error) {
@@ -902,10 +940,10 @@ func decodeMetadataMatch(key string, value jsonValue) (*QueryFilter, error) {
 
 // decodeSingleBound decodes a lone $gt/$gte/$lt/$lte into a range proto
 // condition with only one bound set.
-func decodeSingleBound(op, field string, value jsonValue) (*QueryFilter, error) {
+func decodeSingleBound(op, field string, value jsonValue, target QueryTarget) (*QueryFilter, error) {
 	b := bound{op: op, field: field, value: value}
 
-	return buildRange(field, []bound{b})
+	return buildRange(field, []bound{b}, target)
 }
 
 // bound is a decoded range endpoint.
@@ -921,7 +959,7 @@ func (b bound) isExclusive() bool { return b.op == opGt || b.op == opLt }
 // dateSemanticFields are the builtin uint fields whose bounds represent a moment
 // in time, stored as unsigned Unix microseconds. Their DSL bounds additionally
 // accept an RFC3339 timestamp (coerced through CoerceDatetimeMicros), on top of
-// the raw-microsecond form. Plain-count uint fields (id, logId) and metadata uint
+// the raw-microsecond form. Plain-count uint fields (id, legacy logId) and metadata uint
 // ranges are NOT in this set: they only ever parse as raw uints.
 var dateSemanticFields = map[string]struct{}{
 	"timestamp":  {},
@@ -932,13 +970,20 @@ var dateSemanticFields = map[string]struct{}{
 
 // buildRange assembles one or two same-field bounds into the matching range
 // proto condition, dispatching on the field name.
-func buildRange(field string, bounds []bound) (*QueryFilter, error) {
+func buildRange(field string, bounds []bound, target QueryTarget) (*QueryFilter, error) {
 	// Date-semantic bounds coerce RFC3339 strings to micros; every other uint
 	// field parses raw uints only.
 	coerce := boundUintCoercer(field)
 
 	switch field {
-	case "id", "timestamp", "insertedAt", "revertedAt":
+	case "id":
+		uc, err := uintConditionFromBounds(bounds, coerce)
+		if err != nil {
+			return nil, err
+		}
+
+		return idFilter(uc, target), nil
+	case "timestamp", "insertedAt", "revertedAt":
 		uc, err := uintConditionFromBounds(bounds, coerce)
 		if err != nil {
 			return nil, err

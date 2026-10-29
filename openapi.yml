@@ -6298,8 +6298,9 @@ components:
             - LOGS
           description: >-
             Target entity type. `LOGS` queries return log entries; the log-only
-            filter fields (`logId`, `date`, `ledger`) are valid only when the
-            target is `LOGS`.
+            filter fields (`date`, `ledger`) are valid only when the
+            target is `LOGS`; `id` selects a log ID on `LOGS` and a transaction ID
+            on `TRANSACTIONS`.
         filter:
           $ref: '#/components/schemas/PreparedQueryFilterInput'
           description: >-
@@ -6439,19 +6440,19 @@ components:
 
         Supported fields: `metadata[<key>]`, `address`, `source`, `destination`,
         `reference`, `reverted` (bool), `ledger`, `id`, `timestamp`, `insertedAt`,
-        `revertedAt`, `logId`, `date`. Not every field applies to every query target;
+        `revertedAt`, `date`. Not every field applies to every query target;
         a field that does not apply is rejected. The numeric built-ins
-        (`id`, `timestamp`, `insertedAt`, `revertedAt`, `logId`, `date`) are
-        **range-only** — use `$gt`/`$gte`/`$lt`/`$lte`; `$match` on them is rejected.
-        The log-only fields (`logId`, `date`, `ledger`) are valid only when the
-        prepared query targets `LOGS`; they are rejected on `ACCOUNTS` and
-        `TRANSACTIONS` targets.
+        (`timestamp`, `insertedAt`, `revertedAt`, `date`) are range-only.
+        `id` accepts `$match` for exact lookup and `$gt`/`$gte`/`$lt`/`$lte`
+        for ranges; the query target chooses log or transaction IDs. The
+        log-only fields (`date`, `ledger`) are valid only for `LOGS`. The
+        legacy `logId` range spelling remains accepted for Console clients.
 
 
         A value is either a JSON literal or a parameter reference
         `{"$param": "<name>"}`, resolved at prepared-query execution time. A JSON
         `null` in value position is rejected. uint64 fields
-        (`id`, `timestamp`, `insertedAt`, `revertedAt`, `logId`, `date`) are carried
+        (`id`, `timestamp`, `insertedAt`, `revertedAt`, `date`) are carried
         as decimal strings to stay lossless above 2^53. The date-semantic fields
         (`timestamp`, `insertedAt`, `revertedAt`, `date`) additionally accept an
         RFC3339 timestamp string (e.g. `{"$gte":{"date":"2023-11-14T22:13:20Z"}}`),

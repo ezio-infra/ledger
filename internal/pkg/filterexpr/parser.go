@@ -356,7 +356,7 @@ func (a *FieldCond) toProto(target commonpb.QueryTarget) (*commonpb.QueryFilter,
 		return a.auditToProto()
 	}
 
-	return a.intrinsicToProto()
+	return a.intrinsicToProto(target)
 }
 
 type auditFieldKind int
@@ -419,8 +419,20 @@ func (a *FieldCond) auditToProto() (*commonpb.QueryFilter, error) {
 // transactions) is not decided here — the downstream per-target validity gate
 // (domain.ValidateFilterForTarget) handles that, the same way the structured JSON
 // DSL does.
-func (a *FieldCond) intrinsicToProto() (*commonpb.QueryFilter, error) {
+func (a *FieldCond) intrinsicToProto(target commonpb.QueryTarget) (*commonpb.QueryFilter, error) {
 	switch a.Field {
+	case "id":
+		cond, err := idConditionFromOp(a.Op)
+		if err != nil {
+			return nil, fmt.Errorf("id field: %w", err)
+		}
+		if target == commonpb.QueryTarget_QUERY_TARGET_LOGS {
+			return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_LogId{LogId: &commonpb.LogIdCondition{Cond: cond}}}, nil
+		}
+
+		return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_BuiltinUint{BuiltinUint: &commonpb.BuiltinUintCondition{
+			Field: commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID, Cond: cond,
+		}}}, nil
 	case "timestamp", "date":
 		return a.dateToProto()
 	case "ledger":
@@ -428,6 +440,70 @@ func (a *FieldCond) intrinsicToProto() (*commonpb.QueryFilter, error) {
 	default:
 		return nil, fmt.Errorf("unknown field %q", a.Field)
 	}
+}
+
+func idConditionFromOp(op *MetadataOp) (*commonpb.UintCondition, error) {
+	cond := &commonpb.UintCondition{}
+	set := func(v *Value, lower bool) error {
+		if v.Param != "" {
+			if lower {
+				cond.ParamMin = v.Param
+			} else {
+				cond.ParamMax = v.Param
+			}
+
+			return nil
+		}
+		n, err := strconv.ParseUint(v.resolve(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("id field requires an unsigned integer: %w", err)
+		}
+		if lower {
+			cond.Min = &n
+		} else {
+			cond.Max = &n
+		}
+
+		return nil
+	}
+	switch {
+	case op.Eq != nil:
+		if err := set(op.Eq, true); err != nil {
+			return nil, err
+		}
+		if err := set(op.Eq, false); err != nil {
+			return nil, err
+		}
+	case op.Gt != nil:
+		cond.MinExclusive = true
+		if err := set(op.Gt, true); err != nil {
+			return nil, err
+		}
+	case op.Gte != nil:
+		if err := set(op.Gte, true); err != nil {
+			return nil, err
+		}
+	case op.Lt != nil:
+		cond.MaxExclusive = true
+		if err := set(op.Lt, false); err != nil {
+			return nil, err
+		}
+	case op.Lte != nil:
+		if err := set(op.Lte, false); err != nil {
+			return nil, err
+		}
+	case op.Between != nil:
+		if err := set(op.Between.Low, true); err != nil {
+			return nil, err
+		}
+		if err := set(op.Between.High, false); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.New("id supports ==, >, >=, <, <= and between only")
+	}
+
+	return cond, nil
 }
 
 func auditQF(field commonpb.AuditField, cond *commonpb.AuditCondition) *commonpb.QueryFilter {
