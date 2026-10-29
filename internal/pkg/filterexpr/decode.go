@@ -21,7 +21,9 @@ import (
 // The two representations are:
 //
 //   - structured — the v2 QueryFilter JSON DSL ($and/$or/$not + $match/$gt/…),
-//     decoded by commonpb.QueryFilter.UnmarshalJSON (query_filter.go);
+//     decoded by commonpb.UnmarshalQueryFilterForTarget (query_filter.go).
+//     The target is required to distinguish log `id` from transaction `id`;
+//     context-free QueryFilter.UnmarshalJSON uses transaction semantics;
 //   - textual    — the human-readable filterexpr grammar (metadata[k] == v,
 //     outcome == failure, …), parsed by Parse. The textual grammar resolves a
 //     handful of bare fields against `target` (EN-1549): on QUERY_TARGET_AUDIT
@@ -80,9 +82,10 @@ func DecodeDualFormat(raw []byte, target commonpb.QueryTarget) (*commonpb.QueryF
 //     against it — see handlers_update_prepared_query.go). It passes a non-audit
 //     target for resolution, which is sound because prepared queries are only
 //     ever ACCOUNTS/TRANSACTIONS/LOGS (audit is gRPC-only, never a prepared-query
-//     target — see http.preparedQueryTargets) and every non-audit target resolves
-//     the bare intrinsic fields identically (`timestamp` → transaction range,
-//     `date` → log range, `ledger` → LedgerCondition);
+//     target — see http.preparedQueryTargets). The update handler passes a
+//     transaction target initially, then reads the stored query target and
+//     re-decodes filters containing `id` when that target is LOGS. The FSM
+//     remains the authoritative per-target validity gate;
 //   - the ledgerctl list commands, which DO know their endpoint's target and pass
 //     it (audit list passes QUERY_TARGET_AUDIT so bare audit fields resolve to the
 //     audit arm) but let the server run the authoritative validity gate.
